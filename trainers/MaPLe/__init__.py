@@ -1,0 +1,1 @@
+"""MaPLe trainer entry point."""

@@ -1,0 +1,1 @@
+"""PromptSRC trainer entry point."""
