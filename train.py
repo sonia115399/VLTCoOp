@@ -103,7 +103,7 @@ def extend_cfg(cfg):
             'SCCM_LAMBDA': 'LAMBDA_SCT',
             'VIS_KDSP_LAMBDA': 'LAMBDA_KDV',
             'KDSP_LAMBDA': 'LAMBDA_KDT',
-            'TAU': 'MAD_THRESHOLD',
+            'TAU': 'TEMPERATURE',
             'N_PROMPTS': 'N_CAPTIONS',
         }
         for old_name, new_name in aliases.items():
@@ -194,6 +194,7 @@ def setup_cfg(args):
     cfg.merge_from_list(args.opts)
 
     extend_cfg(cfg)
+    cfg.EVAL_ONLY = args.eval_only
 
     cfg.freeze()
 
@@ -214,7 +215,6 @@ def main(args):
     print("Collecting env info ...")
     print("** System info **\n{}\n".format(collect_env_info()))
 
-    cfg.EVAL_ONLY = args.eval_only
     trainer = build_trainer(cfg)
     print("Trainer built successfully.")
 
