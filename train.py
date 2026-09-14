@@ -85,16 +85,30 @@ def extend_cfg(cfg):
         'CLASS_TOKEN_POSITION': "end",
         'N_CTX': 4,
         'PREC': "fp32",
-        'SCCM_LAMBDA': 1.0,
-        'KDSP_LAMBDA': 1.0,
-        'VIS_SCCM_LAMBDA': 0.0,
-        'VIS_KDSP_LAMBDA': 0.0,
-        'TAU': 1.5,
-        'N_PROMPTS': 50,
+        'LAMBDA_SCV': 0.0,
+        'LAMBDA_SCT': 1.0,
+        'LAMBDA_KDV': 0.0,
+        'LAMBDA_KDT': 1.0,
+        'TEMPERATURE': 0.01,
+        'MAD_THRESHOLD': 1.5,
+        'N_CAPTIONS': 50,
     }
 
     if hasattr(cfg.TRAINER, 'VLTCOOP'):
         current = cfg.TRAINER.VLTCOOP
+        # Configurations released before the dual-teacher formulation used
+        # implementation-specific names. Keep them as migration aliases.
+        aliases = {
+            'VIS_SCCM_LAMBDA': 'LAMBDA_SCV',
+            'SCCM_LAMBDA': 'LAMBDA_SCT',
+            'VIS_KDSP_LAMBDA': 'LAMBDA_KDV',
+            'KDSP_LAMBDA': 'LAMBDA_KDT',
+            'TAU': 'MAD_THRESHOLD',
+            'N_PROMPTS': 'N_CAPTIONS',
+        }
+        for old_name, new_name in aliases.items():
+            if not hasattr(current, new_name) and hasattr(current, old_name):
+                setattr(current, new_name, getattr(current, old_name))
         for k, v in vltcoop_defaults.items():
             if not hasattr(current, k):
                 setattr(current, k, v)
@@ -200,6 +214,7 @@ def main(args):
     print("Collecting env info ...")
     print("** System info **\n{}\n".format(collect_env_info()))
 
+    cfg.EVAL_ONLY = args.eval_only
     trainer = build_trainer(cfg)
     print("Trainer built successfully.")
 

@@ -1,41 +1,120 @@
+import json
 import os.path as osp
-import numpy as np
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
-import random
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
-from dassl.utils import load_pretrained_weights, load_checkpoint
-from dassl.optim import build_optimizer, build_lr_scheduler
 from dassl.metrics import compute_accuracy
+from dassl.optim import build_lr_scheduler, build_optimizer
+from dassl.utils import load_checkpoint, load_pretrained_weights
 from trainers.vltcoop_templates import VLTCOOP_TEMPLATES
-import json
-import os
 
 from clip import clip
-from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
-
-_tokenizer = _Tokenizer()
 
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url)
-
+    model_path = clip._download(clip._MODELS[backbone_name])
     try:
-        # loading JIT archive
         model = torch.jit.load(model_path, map_location="cpu").eval()
         state_dict = None
-
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+    return clip.build_model(state_dict or model.state_dict())
 
-    model = clip.build_model(state_dict or model.state_dict())
 
-    return model
+def _normalized_mean(features):
+    """Average feature vectors and normalize the resulting class prototype."""
+    return F.normalize(features.mean(dim=0), dim=0)
+
+
+def select_caption_groups(caption_features, visual_prototypes, mad_threshold, eps=1e-6):
+    """Apply the paper's group-wise MAD filter to CLIP caption embeddings.
+
+    ``caption_features[i, j]`` is caption group ``j`` for class ``i``. A group
+    is retained or rejected jointly for all classes, exactly as defined by s_j.
+    The returned language prototype deliberately remains a mean of normalized
+    captions; cosine-based distillation normalizes it only when scoring logits.
+    """
+    if caption_features.ndim != 3:
+        raise ValueError("caption_features must have shape [classes, captions, dimension]")
+    if caption_features.shape[0] != visual_prototypes.shape[0]:
+        raise ValueError("caption and visual prototype class counts must match")
+
+    caption_features = F.normalize(caption_features, dim=-1)
+    visual_prototypes = F.normalize(visual_prototypes, dim=-1)
+    scores = (caption_features * visual_prototypes[:, None, :]).sum(dim=-1).mean(dim=0)
+    median = scores.median()
+    mad = (scores - median).abs().median()
+    robust_z = (scores - median) / (mad + eps)
+    mask = robust_z.abs() <= mad_threshold
+
+    # A very small threshold or degenerate score distribution must still leave
+    # one valid caption group for every class.
+    if not mask.any():
+        mask[scores.sub(median).abs().argmin()] = True
+
+    language_prototypes = caption_features[:, mask, :].mean(dim=1)
+    return language_prototypes, mask, scores
+
+
+def _find_caption_file(cfg):
+    """Find generated_prompts.json without coupling the trainer to one layout."""
+    root = getattr(cfg.DATASET, "ROOT", "")
+    dataset_name = getattr(cfg.DATASET, "NAME", "")
+    if not root:
+        return None
+
+    candidates = []
+    if dataset_name:
+        candidates.append(osp.join(root, dataset_name, "generated_prompts.json"))
+    candidates.append(osp.join(root, "generated_prompts.json"))
+    candidates.append(osp.join(root, "generated_prompts", f"{dataset_name}.json"))
+    for candidate in candidates:
+        if osp.isfile(candidate):
+            return candidate
+    return None
+
+
+def _load_caption_pools(cfg, classnames):
+    path = _find_caption_file(cfg)
+    generated = {}
+    if path:
+        with open(path, "r", encoding="utf-8") as handle:
+            generated = json.load(handle)
+        if not isinstance(generated, dict):
+            raise ValueError(f"Caption file must contain a class-to-captions mapping: {path}")
+        print(f"Loaded LLaVA captions from {path}")
+    else:
+        print("No generated_prompts.json found; using curated descriptions as language-teacher fallback.")
+
+    pools = []
+    origins = []
+    for classname in classnames:
+        alternatives = (classname, classname.replace(" ", "_"), classname.replace("_", " "))
+        captions = next((generated[key] for key in alternatives if key in generated), None)
+        if isinstance(captions, dict):
+            captions = captions.get("captions")
+        if isinstance(captions, str):
+            captions = [captions]
+        captions = [caption.strip() for caption in (captions or []) if isinstance(caption, str) and caption.strip()]
+        if captions:
+            pools.append(captions)
+            origins.append("generated")
+            continue
+
+        templates = VLTCOOP_TEMPLATES.get(classname)
+        if templates is None:
+            templates = VLTCOOP_TEMPLATES.get(classname.replace(" ", "_"))
+        if not templates:
+            raise KeyError(f"No generated captions or curated descriptions for class '{classname}'")
+        pools.append(templates)
+        origins.append("template")
+
+    return pools, origins
 
 
 class TextEncoder(nn.Module):
@@ -49,314 +128,138 @@ class TextEncoder(nn.Module):
 
     def forward(self, prompts, tokenized_prompts):
         x = prompts + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.transformer(x.permute(1, 0, 2)).permute(1, 0, 2)
         x = self.ln_final(x).type(self.dtype)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-
-        return x
+        indices = torch.arange(x.shape[0], device=x.device)
+        return x[indices, tokenized_prompts.argmax(dim=-1)] @ self.text_projection
 
 
 class PromptLearner(nn.Module):
-    def __init__(self, cfg, classnames, clip_model):
+    def __init__(self, cfg, classnames, clip_model, visual_prototypes, build_teachers=True):
         super().__init__()
-        n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.VLTCOOP.N_CTX
-        ctx_init = cfg.TRAINER.VLTCOOP.CTX_INIT
+        self.n_cls = len(classnames)
+        self.n_ctx = cfg.TRAINER.VLTCOOP.N_CTX
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        clip_imsize = clip_model.visual.input_resolution
-        cfg_imsize = cfg.INPUT.SIZE[0]
-        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+        if cfg.INPUT.SIZE[0] != clip_model.visual.input_resolution:
+            raise ValueError("INPUT.SIZE must equal the CLIP visual input resolution")
 
-        if ctx_init and n_ctx <= 4:
-            # use given words to initialize context vectors
-            ctx_init = ctx_init.replace("_", " ")
-            n_ctx = n_ctx
-            prompt = clip.tokenize(ctx_init)
+        ctx_init = cfg.TRAINER.VLTCOOP.CTX_INIT.replace("_", " ")
+        if ctx_init and self.n_ctx <= 4:
+            tokenized_init = clip.tokenize(ctx_init)
             with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
+                ctx_vectors = clip_model.token_embedding(tokenized_init).type(dtype)[0, 1:1 + self.n_ctx]
             prompt_prefix = ctx_init
         else:
-            # random initialization
-            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            ctx_vectors = torch.empty(self.n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * n_ctx)
-        print(f'Initial text context: "{prompt_prefix}"')
-        print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
+            prompt_prefix = " ".join(["X"] * self.n_ctx)
         self.ctx = nn.Parameter(ctx_vectors)
+        print(f'Initial text context: "{prompt_prefix}"')
+        print(f"Number of context words: {self.n_ctx}")
 
-        # classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompts = [prompt_prefix + " " + name + "." for name in classnames]
-
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
-        # Create frozen CLIP teachers for language and visual supervision.
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        clip_model_temp = load_clip_to_cpu(cfg).float().to(device)
-        clip_model_temp_image = load_clip_to_cpu(cfg).float().to(device)
+        prompt_texts = [f"{prompt_prefix} {name.replace('_', ' ')}." for name in classnames]
+        tokenized_prompts = torch.cat([clip.tokenize(text) for text in prompt_texts])
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-            self.ZS_image_encoder = clip_model_temp_image.visual
-            # Now pre-compute the frozen VL embeddings
-            all_teacher_features = []
+        self.register_buffer("token_prefix", embedding[:, :1, :])
+        self.register_buffer("token_suffix", embedding[:, 1 + self.n_ctx:, :])
+        self.register_buffer("tokenized_prompts", tokenized_prompts)
 
-            # Load optional VLM-generated class descriptions from the dataset tree.
-            gen_prompts = {}
-            try:
-                dataset_root = getattr(cfg.DATASET, 'ROOT', None)
-                dataset_name = getattr(cfg.DATASET, 'NAME', None)
-                load_path = None
+        feature_dim = visual_prototypes.shape[-1]
+        language_prototypes = torch.zeros(self.n_cls, feature_dim, dtype=visual_prototypes.dtype)
+        if build_teachers:
+            pools, origins = _load_caption_pools(cfg, classnames)
+            n_captions = cfg.TRAINER.VLTCOOP.N_CAPTIONS
+            caption_texts = [
+                pool[group_index % len(pool)]
+                for group_index in range(n_captions)
+                for pool in pools
+            ]
+            with torch.no_grad():
+                tokens = torch.cat([clip.tokenize(text) for text in caption_texts])
+                features = F.normalize(clip_model.encode_text(tokens).float(), dim=-1)
+            caption_features = features.reshape(n_captions, self.n_cls, -1).permute(1, 0, 2)
+            caption_features = caption_features.to(visual_prototypes.dtype)
+            language_prototypes, mask, scores = select_caption_groups(
+                caption_features,
+                visual_prototypes.cpu(),
+                cfg.TRAINER.VLTCOOP.MAD_THRESHOLD,
+            )
+            print(
+                f"Language teacher: retained {int(mask.sum())}/{n_captions} caption groups "
+                f"with MAD threshold {cfg.TRAINER.VLTCOOP.MAD_THRESHOLD}."
+            )
+            for classname, origin in zip(classnames, origins):
+                print(f"  {classname}: {origin}")
+            self.register_buffer("caption_group_scores", scores, persistent=False)
+            self.register_buffer("caption_group_mask", mask, persistent=False)
+        else:
+            self.register_buffer("caption_group_scores", torch.empty(0), persistent=False)
+            self.register_buffer("caption_group_mask", torch.empty(0, dtype=torch.bool), persistent=False)
 
-                def try_generated_prompt_base(base_dir):
-                    nonlocal gen_prompts, load_path
-                    cand1 = os.path.join(base_dir, 'generated_prompts.json')
-                    if os.path.isfile(cand1):
-                        with open(cand1, 'r', encoding='utf-8') as f:
-                            gen_prompts = json.load(f)
-                            load_path = cand1
-                            return True
-                    cand2_dir = os.path.join(base_dir, 'generated_prompts')
-                    if os.path.isdir(cand2_dir):
-                        label_for_file = dataset_name or os.path.basename(os.path.normpath(base_dir))
-                        if label_for_file:
-                            cand_ds = os.path.join(cand2_dir, f"{label_for_file}.json")
-                            if os.path.isfile(cand_ds):
-                                with open(cand_ds, 'r', encoding='utf-8') as f:
-                                    gen_prompts = json.load(f)
-                                    load_path = cand_ds
-                                    return True
-                        merged = {}
-                        for fn in os.listdir(cand2_dir):
-                            if fn.lower().endswith('.json'):
-                                path = os.path.join(cand2_dir, fn)
-                                try:
-                                    with open(path, 'r', encoding='utf-8') as f:
-                                        data = json.load(f)
-                                        if isinstance(data, dict):
-                                            merged.update(data)
-                                except Exception:
-                                    continue
-                        if merged:
-                            gen_prompts = merged
-                            load_path = cand2_dir
-                            return True
-                    return False
-
-                if dataset_root:
-                    dirs_to_check = []
-                    if dataset_name:
-                        ds_dir = os.path.abspath(os.path.join(dataset_root, dataset_name))
-                        if os.path.isdir(ds_dir):
-                            dirs_to_check.append(ds_dir)
-                    for up in range(0, 3):
-                        dir_to_check = os.path.abspath(os.path.join(dataset_root, *(['..'] * up)))
-                        if dir_to_check not in dirs_to_check:
-                            dirs_to_check.append(dir_to_check)
-                    for base_dir in dirs_to_check:
-                        if try_generated_prompt_base(base_dir):
-                            break
-                if load_path:
-                    try:
-                        # prefer logging when available; otherwise print
-                        import logging
-                        logging.info(f"Loaded generated prompts from {load_path}")
-                    except Exception:
-                        print(f"Loaded generated prompts from {load_path}")
-            except Exception:
-                gen_prompts = {}
-
-            def prompts_for_class(name):
-                # try exact key
-                if name in gen_prompts:
-                    return gen_prompts[name]
-                # try replacing spaces/underscores
-                k = name.replace(' ', '_')
-                if k in gen_prompts:
-                    return gen_prompts[k]
-                k2 = name.replace('_', ' ')
-                if k2 in gen_prompts:
-                    return gen_prompts[k2]
-                # fallback empty
-                return None
-
-            prompt_pool = {}
-            prompt_origin = {}
-            resolved_prompt_usage = {classname: [] for classname in classnames}
-
-            for classname in classnames:
-                gp = prompts_for_class(classname)
-                if gp and len(gp) > 0:
-                    prompt_pool[classname] = gp
-                    prompt_origin[classname] = "generated"
-                else:
-                    tmpl = VLTCOOP_TEMPLATES.get(classname, None)
-                    if tmpl is None:
-                        tmpl = VLTCOOP_TEMPLATES.get(classname.replace(' ', '_'), None)
-                    if tmpl is None:
-                        raise KeyError(f"No template or generated prompts for class '{classname}'")
-                    prompt_pool[classname] = tmpl
-                    prompt_origin[classname] = "template"
-
-            for i in range(cfg.TRAINER.VLTCOOP.N_PROMPTS):
-                tokens = []
-                for classname in classnames:
-                    pool = prompt_pool[classname]
-                    txt = pool[i % len(pool)]
-                    resolved_prompt_usage[classname].append(txt)
-                    tokens.append(clip.tokenize(txt))
-                x_tokenized = torch.cat(tokens)
-                text_features = clip_model_temp.encode_text(x_tokenized.to(device))
-                all_teacher_features.append(text_features.unsqueeze(1))
-
-        self.fixed_embeddings = torch.cat(all_teacher_features, dim=1)
-        try:
-            import logging
-            log = logging.getLogger(__name__)
-            log_fn = log.info if log.handlers else print
-        except Exception:
-            log_fn = print
-
-        log_fn("Resolved prompts per class:")
-        for classname in classnames:
-            origin = prompt_origin.get(classname, 'template')
-            log_fn(f"  {classname} (source: {origin}):")
-            for idx, text in enumerate(resolved_prompt_usage.get(classname, [])):
-                log_fn(f"    [{idx:02d}] {text}")
-        # These buffers are reconstructed from the current class names on load.
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
-
-        self.n_cls = n_cls
-        self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
-        self.name_lens = name_lens
-
-    def construct_prompts(self, ctx, prefix, suffix, label=None):
-        # dim0 is either batch_size (during training) or n_cls (during testing)
-        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
-        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
-        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
-
-        if label is not None:
-            prefix = prefix[label]
-            suffix = suffix[label]
-
-        prompts = torch.cat(
-            [
-                prefix,  # (dim0, 1, dim)
-                ctx,  # (dim0, n_ctx, dim)
-                suffix,  # (dim0, *, dim)
-            ],
-            dim=1,
-        )
-
-        return prompts
+        # Targets are rebuilt from the current support set at training startup
+        # and intentionally omitted from checkpoints/inference construction.
+        self.register_buffer("language_prototypes", language_prototypes, persistent=False)
 
     def forward(self):
-        ctx = self.ctx
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
-
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        prompts = self.construct_prompts(ctx, prefix, suffix)
-
-        return prompts
+        ctx = self.ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+        return torch.cat([self.token_prefix, ctx, self.token_suffix], dim=1)
 
 
 class CustomCLIP(nn.Module):
-    def __init__(self, cfg, classnames, clip_model, visual_class_means):
+    def __init__(self, cfg, classnames, clip_model, visual_prototypes, build_teachers=True):
         super().__init__()
-        self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.cfg = cfg
+        self.prompt_learner = PromptLearner(
+            cfg, classnames, clip_model, visual_prototypes, build_teachers=build_teachers
+        )
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
-        self.total_epochs = cfg.OPTIM.MAX_EPOCH
-        self.n_cls = len(classnames)
-        self.cfg = cfg
-        self.register_buffer("visual_class_means", visual_class_means)
+        self.temperature = float(cfg.TRAINER.VLTCOOP.TEMPERATURE)
+        if self.temperature <= 0:
+            raise ValueError("TRAINER.VLTCOOP.TEMPERATURE must be positive")
+        self.register_buffer("visual_prototypes", visual_prototypes, persistent=False)
+
+    def _distribution_logits(self, image_features, class_features):
+        return image_features @ F.normalize(class_features, dim=-1).t() / self.temperature
 
     def forward(self, image, label=None):
-        tokenized_prompts = self.tokenized_prompts
-        logit_scale = self.logit_scale.exp()
-
         prompts = self.prompt_learner()
+        text_features = F.normalize(self.text_encoder(prompts, self.prompt_learner.tokenized_prompts), dim=-1)
+        image_features = F.normalize(self.image_encoder(image.type(self.dtype)), dim=-1)
+        student_logits = self._distribution_logits(image_features, text_features)
 
-        # Compute the prompted image and text features
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-        image_features = self.image_encoder(image.type(self.dtype))
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        # Compute the prompted logits
-        logits = logit_scale * image_features @ text_features.t()
-        if self.prompt_learner.training:
-            
-            # Visual Teacher Branch
-            visual_class_means = self.visual_class_means
-            proto_logits = logit_scale * image_features @ visual_class_means.t()
-            #proto_logits = logit_scale * text_features @ visual_class_means.t()
-            # Now calculate the frozen pre-trained features
-            fixed_embeddings = self.prompt_learner.fixed_embeddings  # precomputed pre-trained frozen textual features
-            fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
-            with torch.no_grad():
-                zero_shot_features = self.prompt_learner.ZS_image_encoder(image.type(self.dtype))
-                zero_shot_features = zero_shot_features / zero_shot_features.norm(dim=-1, keepdim=True)
+        if not self.training:
+            return student_logits
+        if label is None:
+            raise ValueError("Labels are required while training VLTCoOp")
 
-                scores = []
-                for i in range(fixed_embeddings.shape[1]):
-                    temp_logits = logit_scale * visual_class_means @ fixed_embeddings[:, i, :].to(visual_class_means.device).t()
-                    scores.append(torch.max(temp_logits, dim=1).values.mean())
+        visual_prototypes = F.normalize(self.visual_prototypes, dim=-1)
+        language_prototypes = self.prompt_learner.language_prototypes
+        vision_teacher_logits = self._distribution_logits(image_features, visual_prototypes)
+        language_teacher_logits = self._distribution_logits(image_features, language_prototypes)
 
-                scores = torch.stack(scores)
-                median = scores.median()
-                mad = (scores - median).abs().median()
-                robust_z = (scores - median) / mad.clamp_min(torch.finfo(scores.dtype).eps)
-                tau = self.cfg.TRAINER.VLTCOOP.TAU
-                spread = robust_z.std(unbiased=False).clamp_min(torch.finfo(scores.dtype).eps)
-                mask = ((robust_z - robust_z.mean()).abs() / spread) <= tau
-                if not mask.any():
-                    mask = torch.ones_like(mask, dtype=torch.bool)
-                selected_embeddings = fixed_embeddings[:,mask].mean(dim=1)
-                selected_embeddings = selected_embeddings / selected_embeddings.norm(dim=-1, keepdim=True)
-                
-            fixed_embeddings = fixed_embeddings.mean(dim=1)
-            fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
-            zero_shot_logits = logit_scale * zero_shot_features @ selected_embeddings.to(zero_shot_features.device).t()
-            loss_ce = F.cross_entropy(logits,
-                                   label)
-            
-            loss_mse = torch.nn.MSELoss()
-            loss_sccm = loss_mse(text_features, selected_embeddings.to(text_features.device)) * self.cfg.TRAINER.VLTCOOP.SCCM_LAMBDA
+        loss_ce = F.cross_entropy(student_logits, label)
+        loss_scv = F.mse_loss(text_features, visual_prototypes)
+        loss_sct = F.mse_loss(text_features, language_prototypes)
+        loss_kdv = F.kl_div(
+            F.log_softmax(student_logits, dim=1), F.softmax(vision_teacher_logits.detach(), dim=1), reduction="batchmean"
+        )
+        loss_kdt = F.kl_div(
+            F.log_softmax(student_logits, dim=1), F.softmax(language_teacher_logits.detach(), dim=1), reduction="batchmean"
+        )
 
-            loss_kdsp = F.kl_div(
-                F.log_softmax(logits, dim=1),
-                F.log_softmax(zero_shot_logits, dim=1),
-                reduction='sum',
-                log_target=True
-            ) / logits.numel()
-            loss_kdsp = loss_kdsp * self.cfg.TRAINER.VLTCOOP.KDSP_LAMBDA
-            
-            # Visual Losses
-            # Visual SCCM: MSE between text_features (learnable) and visual_class_means (frozen)
-            loss_sccm_vis = loss_mse(text_features, visual_class_means) * getattr(self.cfg.TRAINER.VLTCOOP, 'VIS_SCCM_LAMBDA', 0.0)
-            
-            # Visual KDSP: KL Div between logits (student) and proto_logits (teacher)
-            loss_kdsp_vis = F.kl_div(
-                F.log_softmax(logits, dim=1),
-                F.log_softmax(proto_logits, dim=1),
-                reduction='sum',
-                log_target=True
-            ) / logits.numel()
-            loss_kdsp_vis = loss_kdsp_vis * getattr(self.cfg.TRAINER.VLTCOOP, 'VIS_KDSP_LAMBDA', 0.0)
-
-            return logits, loss_ce, loss_sccm, loss_kdsp, loss_sccm_vis, loss_kdsp_vis
-        else:
-            return logits
+        weights = self.cfg.TRAINER.VLTCOOP
+        return (
+            student_logits,
+            loss_ce,
+            weights.LAMBDA_SCV * loss_scv,
+            weights.LAMBDA_SCT * loss_sct,
+            weights.LAMBDA_KDV * loss_kdv,
+            weights.LAMBDA_KDT * loss_kdt,
+        )
 
 
 @TRAINER_REGISTRY.register()
@@ -364,210 +267,106 @@ class VLTCoOp_CLIP(TrainerX):
     def check_cfg(self, cfg):
         assert cfg.TRAINER.VLTCOOP.PREC in ["fp16", "fp32", "amp"]
 
+    def _build_visual_prototypes(self, clip_model, classnames):
+        print("Computing frozen vision-teacher prototypes from the support set...")
+        features, labels = [], []
+        with torch.no_grad():
+            for batch in self.dm.train_loader:
+                images = batch["img"].to(self.device)
+                feature = F.normalize(clip_model.visual(images.type(clip_model.dtype)), dim=-1)
+                features.append(feature)
+                labels.append(batch["label"].to(self.device))
+        features = torch.cat(features)
+        labels = torch.cat(labels)
+        prototypes = []
+        for class_index in range(len(classnames)):
+            class_features = features[labels == class_index]
+            if class_features.numel() == 0:
+                raise ValueError(f"Support set has no image for class index {class_index}")
+            prototypes.append(_normalized_mean(class_features))
+        return torch.stack(prototypes)
+
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
-
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
-
-        if cfg.TRAINER.VLTCOOP.PREC == "fp32" or cfg.TRAINER.VLTCOOP.PREC == "amp":
-            # CLIP's default precision is fp16
+        if cfg.TRAINER.VLTCOOP.PREC in ["fp32", "amp"]:
             clip_model.float()
+        clip_model.eval().to(self.device)
 
-        print("Computing visual prototypes...")
-        
-        # Preserve stochastic training behavior while constructing frozen prototypes.
-        rng_state = torch.get_rng_state()
-        if torch.cuda.is_available():
-            cuda_rng_state = torch.cuda.get_rng_state()
-        np_rng_state = np.random.get_state()
-        py_rng_state = random.getstate()
+        build_teachers = not getattr(cfg, "EVAL_ONLY", False)
+        if build_teachers:
+            visual_prototypes = self._build_visual_prototypes(clip_model, classnames)
+        else:
+            # Evaluation uses only the learned context and frozen CLIP encoders.
+            feature_dim = clip_model.text_projection.shape[-1]
+            visual_prototypes = torch.zeros(len(classnames), feature_dim, device=self.device, dtype=clip_model.dtype)
+            print("Evaluation-only mode: skipped teacher and caption construction.")
 
-        visual_features = []
-        labels = []
-        
-        clip_model.to(self.device)
-        
-        with torch.no_grad():
-            for batch in self.dm.train_loader:
-                input = batch["img"].to(self.device)
-                label = batch["label"].to(self.device)
-                image_features = clip_model.visual(input.type(clip_model.dtype))
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                visual_features.append(image_features)
-                labels.append(label)
-        
-        # Restore RNG state
-        torch.set_rng_state(rng_state)
-        if torch.cuda.is_available():
-            torch.cuda.set_rng_state(cuda_rng_state)
-        np.random.set_state(np_rng_state)
-        random.setstate(py_rng_state)
-
-        visual_features = torch.cat(visual_features, dim=0)
-        labels = torch.cat(labels, dim=0)
-        
-        visual_class_means = []
-        for i in range(len(classnames)):
-            idx = (labels == i).nonzero(as_tuple=True)[0]
-            if len(idx) == 0:
-                mean_feat = torch.zeros(visual_features.shape[1], device=self.device, dtype=visual_features.dtype)
-            else:
-                mean_feat = visual_features[idx].mean(dim=0)
-            mean_feat = mean_feat / mean_feat.norm()
-            visual_class_means.append(mean_feat)
-            
-        visual_class_means = torch.stack(visual_class_means)
-        print(f"Computed visual class prototypes for {len(visual_class_means)} classes")
-        
         clip_model.to("cpu")
-
-        print("Building custom CLIP")
-        self.model = CustomCLIP(cfg, classnames, clip_model.eval(), visual_class_means)
-
-        print("Turning off gradients in both the image and the text encoder")
-        names_to_update = ["prompt_learner.ctx"]
-
-        for name, param in self.model.named_parameters():
-            if name not in names_to_update:
-                param.requires_grad_(False)
-
-
-        # Double check
-        enabled = set()
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                enabled.add(name)
+        self.model = CustomCLIP(cfg, classnames, clip_model.eval(), visual_prototypes.cpu(), build_teachers)
+        for name, parameter in self.model.named_parameters():
+            parameter.requires_grad_(name == "prompt_learner.ctx")
+        enabled = {name for name, parameter in self.model.named_parameters() if parameter.requires_grad}
         print(f"Parameters to be updated: {enabled}")
-        print(f"Parameters count: {len(enabled)}")
+
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
-
         self.model.to(self.device)
         self.optim = build_optimizer(self.model, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model, self.optim, self.sched)
-        # Cosine scheduler
-        self.total_epochs = cfg.OPTIM.MAX_EPOCH
-        self.step_counter = 1
         self.scaler = GradScaler() if cfg.TRAINER.VLTCOOP.PREC == "amp" else None
-        # Note that multi-gpu training could be slow because CLIP's size is
-        # big, which slows down the copy operation in DataParallel
-        device_count = torch.cuda.device_count()
-        if device_count > 1:
-            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
+        if torch.cuda.device_count() > 1:
+            print(f"Multiple GPUs detected (n_gpus={torch.cuda.device_count()}), using DataParallel.")
             self.model = nn.DataParallel(self.model)
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-
-        model = self.model
-        optim = self.optim
-        scaler = self.scaler
-
-        prec = self.cfg.TRAINER.VLTCOOP.PREC
-        if prec == "amp":
+        if self.cfg.TRAINER.VLTCOOP.PREC == "amp":
             with autocast():
-                logits, loss_ce, loss_sccm, loss_kdsp, loss_sccm_vis, loss_kdsp_vis = model(image, label)
-                loss = loss_ce + loss_sccm + loss_kdsp + loss_sccm_vis + loss_kdsp_vis
-            optim.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optim)
-            scaler.update()
+                logits, loss_ce, loss_scv, loss_sct, loss_kdv, loss_kdt = self.model(image, label)
+                loss = loss_ce + loss_scv + loss_sct + loss_kdv + loss_kdt
+            self.optim.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optim)
+            self.scaler.update()
         else:
-            logits, loss_ce, loss_sccm, loss_kdsp, loss_sccm_vis, loss_kdsp_vis = model(image, label)
-            
-            loss = loss_ce + loss_sccm + loss_kdsp + loss_sccm_vis + loss_kdsp_vis
+            logits, loss_ce, loss_scv, loss_sct, loss_kdv, loss_kdt = self.model(image, label)
+            loss = loss_ce + loss_scv + loss_sct + loss_kdv + loss_kdt
             self.model_backward_and_update(loss)
-
-        loss_summary = {
-            "loss": loss.item(),
-            "acc": compute_accuracy(logits, label)[0].item(),
-            "loss_ce": loss_ce.item(),
-            "loss_sccm": loss_sccm.item(),
-            "loss_kdsp": loss_kdsp.item(),
-            "loss_sccm_vis": loss_sccm_vis.item(),
-            "loss_kdsp_vis": loss_kdsp_vis.item(),
-        }
 
         if (self.batch_idx + 1) == self.num_batches:
             self.update_lr()
-
-        return loss_summary
+        return {
+            "loss": loss.item(),
+            "acc": compute_accuracy(logits, label)[0].item(),
+            "loss_ce": loss_ce.item(),
+            "loss_scv": loss_scv.item(),
+            "loss_sct": loss_sct.item(),
+            "loss_kdv": loss_kdv.item(),
+            "loss_kdt": loss_kdt.item(),
+        }
 
     def parse_batch_train(self, batch):
-        input = batch["img"]
-        label = batch["label"]
-        input = input.to(self.device)
-        label = label.to(self.device)
-        return input, label
+        return batch["img"].to(self.device), batch["label"].to(self.device)
 
     def load_model(self, directory, epoch=None):
         if not directory:
             print("Note that load_model() is skipped as no pretrained model is given")
             return
-
-        names = self.get_model_names()
-
-        # Build candidate list in priority order
-        candidates = []
-        if epoch is not None:
-            candidates.append(f"model.pth.tar-{epoch}")
-            candidates.append("model.pth.tar")
-        else:
-            # Prefer rolling latest checkpoint if available, then fall back to best
-            candidates.append("model.pth.tar")
-            candidates.append("model-best.pth.tar")
-
-        for name in names:
-            model_path = None
-            for cand in candidates:
-                p = osp.join(directory, name, cand)
-                if osp.exists(p):
-                    model_path = p
-                    break
+        candidates = [f"model.pth.tar-{epoch}", "model.pth.tar"] if epoch is not None else ["model.pth.tar", "model-best.pth.tar"]
+        for name in self.get_model_names():
+            model_path = next((osp.join(directory, name, candidate) for candidate in candidates if osp.isfile(osp.join(directory, name, candidate))), None)
             if model_path is None:
-                # Compose an informative error
-                raise FileNotFoundError(
-                    'No checkpoint found under "{}" (tried: {})'.format(
-                        osp.join(directory, name), ", ".join(candidates)
-                    )
-                )
-
+                raise FileNotFoundError(f"No checkpoint found under {osp.join(directory, name)}")
             checkpoint = load_checkpoint(model_path)
             state_dict = checkpoint["state_dict"]
-            epoch = checkpoint["epoch"]
-
-            # Ignore fixed token vectors
-            if "prompt_learner.token_prefix" in state_dict:
-                del state_dict["prompt_learner.token_prefix"]
-
-            if "prompt_learner.token_suffix" in state_dict:
-                del state_dict["prompt_learner.token_suffix"]
-
-            # Filter out keys with shape mismatch (e.g., class-dependent buffers)
-            current_state = self._models[name].state_dict()
-            filtered_state = {}
-            skipped = []
-            for k, v in state_dict.items():
-                if k in current_state:
-                    try:
-                        if tuple(current_state[k].shape) == tuple(v.shape):
-                            filtered_state[k] = v
-                        else:
-                            skipped.append((k, tuple(v.shape), tuple(current_state[k].shape)))
-                    except Exception:
-                        # If shape is not available/comparable, skip conservatively
-                        skipped.append((k, None, None))
-                else:
-                    # Key not in current model; safe to skip under strict=False
-                    continue
-
-            if skipped:
-                msg = "; ".join([f"{kk} ckpt_shape={cs} current_shape={ms}" for kk, cs, ms in skipped])
-                print(f"[load_model] Skipping {len(skipped)} mismatched keys: {msg}")
-
-            print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
-            # Load only compatible keys with strict=False to allow missing ones
-            self._models[name].load_state_dict(filtered_state, strict=False)
+            # Prompt token buffers depend on the active classes and are rebuilt.
+            state_dict.pop("prompt_learner.token_prefix", None)
+            state_dict.pop("prompt_learner.token_suffix", None)
+            current = self._models[name].state_dict()
+            compatible = {key: value for key, value in state_dict.items() if key in current and tuple(value.shape) == tuple(current[key].shape)}
+            print(f"Loading weights to {name} from {model_path} (epoch = {checkpoint['epoch']})")
+            self._models[name].load_state_dict(compatible, strict=False)

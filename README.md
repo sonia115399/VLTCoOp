@@ -45,7 +45,9 @@ To generate 50 descriptions per class from a local dataset:
 python scripts/generate_vlm_prompts.py \
   --data-root data/tea \
   --out-file data/tea/generated_prompts.json \
-  --n-prompts 50
+  --n-prompts 50 \
+  --llava-model llava-hf/llava-1.5-7b-hf \
+  --support-cache data/tea/split_fewshot/shot_16-seed_1.pkl
 ```
 
 ## Training
@@ -94,6 +96,12 @@ arguments. For example, CoOp on the tea dataset can be launched with:
 
 ```bash
 bash scripts/coop/few_shot.sh data tea 16 CLIP
+```
+
+BiomedCoOp uses the same positional arguments:
+
+```bash
+bash scripts/biomedcoop/few_shot.sh data tea 16 CLIP
 ```
 
 ## Repository Layout

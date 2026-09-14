@@ -1,13 +1,16 @@
 """
-Generate per-class lesion-focused captions for a dataset.
+Generate per-class lesion-focused LLaVA captions for a support set.
 
 Policy:
 - Looks for class subdirectories under --data-root (each subdir = class name).
-- For each class, samples images (cycling if necessary) to generate N captions (default 50).
-- Tries a multimodal LLaVA model if --model-dir is provided and can be loaded.
-  If that fails or not provided, falls back to BLIP (image captioning) + Flan-T5 rewriter.
+- For each class, visits support images in round-robin order until it has N
+  unique captions (default 50).
+- Each visit applies a lesion-preserving random resized crop, optional flip,
+  and mild color jitter before stochastic LLaVA decoding.
 - Enforces 10-20 word constraint via regeneration attempts and light postprocessing.
-- Saves JSON mapping: { class_name: [caption1, caption2, ...], ... }
+- Saves JSON mapping: { class_name: [caption1, caption2, ...], ... }.
+- BLIP + Flan-T5 is available only through --allow-fallback; it is not the
+  VLTCoOp language teacher described in the paper.
 
 Usage example:
   python scripts/generate_vlm_prompts.py \
@@ -21,10 +24,13 @@ import argparse
 import os
 import random
 import json
+import pickle
+from collections import defaultdict
 from pathlib import Path
 from PIL import Image
 import torch
 from tqdm import tqdm
+from torchvision import transforms as T
 
 from transformers import (
     pipeline,
@@ -70,8 +76,33 @@ def safe_load_blip(device):
 
 
 class CaptionGenerator:
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda', llava_model='llava-hf/llava-1.5-7b-hf', allow_fallback=False):
         self.device = device if torch.cuda.is_available() else 'cpu'
+        self.llava_processor = None
+        self.llava = None
+        try:
+            # Dynamic imports keep this utility importable with legacy
+            # transformers versions while producing an actionable error.
+            import transformers
+            processor_class = getattr(transformers, 'AutoProcessor')
+            model_class = getattr(transformers, 'AutoModelForVision2Seq', None)
+            if model_class is None:
+                model_class = getattr(transformers, 'LlavaForConditionalGeneration')
+            dtype = torch.float16 if self.device == 'cuda' else torch.float32
+            self.llava_processor = processor_class.from_pretrained(llava_model)
+            self.llava = model_class.from_pretrained(llava_model, torch_dtype=dtype).to(self.device).eval()
+            print(f'Loaded LLaVA caption model: {llava_model}')
+        except Exception as exc:
+            if not allow_fallback:
+                raise RuntimeError(
+                    'Unable to load LLaVA. Install a transformers version with LLaVA support or pass '
+                    '--allow-fallback to use the non-method BLIP + Flan-T5 fallback.'
+                ) from exc
+            print(f'Warning: LLaVA unavailable ({exc}); using BLIP + Flan-T5 fallback.')
+
+        if self.llava is not None:
+            return
+
         # load flan-t5 base for rewriting
         self.rewriter_name = 'google/flan-t5-large'
         try:
@@ -89,7 +120,7 @@ class CaptionGenerator:
     def rewrite_caption(self, caption, instruction, tries=3):
         # Compose a prompt for the rewriter
         prompt = (
-            "Rewrite the following image caption to be 10-20 words, with no numbering or newlines, and emphasize discriminative visual cues as instructed. "
+            "Rewrite the following image caption to be 20-30 words, with no numbering or newlines, and emphasize discriminative visual cues as instructed. "
             f"Instruction: {instruction}\nCaption: {caption}\n\nRewritten caption:"
         )
         inputs = self.rewriter_tokenizer(prompt, return_tensors='pt', truncation=True).to(self.device)
@@ -98,24 +129,54 @@ class CaptionGenerator:
             out = self.rewriter.generate(**inputs, **gen_kwargs)
             text = self.rewriter_tokenizer.decode(out[0], skip_special_tokens=True).strip()
             text = ' '.join(text.split())
-            if 10 <= len(text.split()) <= 20:
+            if 20 <= len(text.split()) <= 30:
                 return text
         # final best-effort: adjust length heuristically
         words = text.split()
-        if len(words) < 10:
-            # append adjectives to reach ~12 words
-            extras = ['scattered', 'small', 'confluent', 'along veins', 'near margin', 'distinct']
-            needed = 12 - len(words)
+        if len(words) < 20:
+            # Append conservative visual modifiers to reach the requested range.
+            extras = ['scattered', 'small', 'confluent', 'distinct', 'marginal', 'vein-adjacent', 'irregular', 'chlorotic', 'necrotic', 'textured', 'localized', 'visible']
+            needed = 20 - len(words)
             words += extras[:needed]
+            while len(words) < 20:
+                words.append('visible')
             return ' '.join(words)
-        if len(words) > 20:
-            return ' '.join(words[:20])
+        if len(words) > 30:
+            return ' '.join(words[:30])
         return text
 
-    def generate_for_image(self, image_path, instruction):
+    def _generate_llava(self, image, instruction):
+        conversation = [{
+            'role': 'user',
+            'content': [
+                {'type': 'image'},
+                {'type': 'text', 'text': instruction},
+            ],
+        }]
+        if hasattr(self.llava_processor, 'apply_chat_template'):
+            prompt = self.llava_processor.apply_chat_template(conversation, add_generation_prompt=True)
+        else:
+            prompt = f'USER: <image>\\n{instruction}\\nASSISTANT:'
+        inputs = self.llava_processor(text=prompt, images=image, return_tensors='pt')
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        with torch.no_grad():
+            output_ids = self.llava.generate(
+                **inputs,
+                max_new_tokens=80,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.95,
+            )
+        generated_ids = output_ids[:, inputs['input_ids'].shape[1]:]
+        return self.llava_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+    def generate_for_image(self, image, instruction):
+        if self.llava is not None:
+            return self._generate_llava(image, instruction)
+
         # Step 1: get base caption via BLIP (or pipeline)
         base_caption = None
-        img = Image.open(image_path).convert('RGB')
+        img = image
         # If blip returned processor+model tuple
         if isinstance(self.blip, tuple):
             try:
@@ -145,6 +206,15 @@ class CaptionGenerator:
         if final.lower().startswith('diseased leaf'):
             final = final[len('diseased leaf'):].strip().lstrip('.,;:')
         return final
+
+
+def render_lesion_preserving_view(image):
+    """Vary framing and illumination without synthesizing lesion content."""
+    height, width = image.height, image.width
+    image = T.RandomResizedCrop((height, width), scale=(0.80, 1.0), ratio=(0.9, 1.1))(image)
+    if random.random() < 0.5:
+        image = T.functional.hflip(image)
+    return T.ColorJitter(brightness=0.10, contrast=0.10, saturation=0.05, hue=0.02)(image)
 
 
 def collect_class_image_paths(data_root):
@@ -191,25 +261,46 @@ def collect_class_image_paths(data_root):
     return classes
 
 
+def collect_support_cache_paths(cache_path):
+    """Read the exact train split saved by the dataset's few-shot sampler."""
+    with open(cache_path, 'rb') as handle:
+        cached = pickle.load(handle)
+    train_items = cached.get('train') if isinstance(cached, dict) else None
+    if not train_items:
+        raise ValueError(f'Few-shot cache has no non-empty train split: {cache_path}')
+    classes = defaultdict(list)
+    for item in train_items:
+        classname = getattr(item, 'classname', None)
+        impath = getattr(item, 'impath', None)
+        if not classname or not impath:
+            raise ValueError(f'Invalid support item in {cache_path}')
+        classes[classname].append(impath)
+    return dict(classes)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-root', required=True, help='Path to dataset root (folders per class)')
     parser.add_argument('--out-file', required=True, help='Output JSON file to write mapping')
+    parser.add_argument('--support-cache', help='Optional split_fewshot/shot_*-seed_*.pkl; captions then use the exact training support set')
     parser.add_argument('--n-prompts', type=int, default=50)
+    parser.add_argument('--llava-model', default='llava-hf/llava-1.5-7b-hf')
+    parser.add_argument('--allow-fallback', action='store_true', help='Allow BLIP + Flan-T5 if LLaVA cannot load')
+    parser.add_argument('--allow-incomplete', action='store_true', help='Write fewer than N captions when unique decoding is exhausted')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--max-retries', type=int, default=3)
     parser.add_argument('--instruction', default=DEFAULT_INSTRUCTION)
     args = parser.parse_args()
 
     random.seed(args.seed)
-    classes = collect_class_image_paths(args.data_root)
+    classes = collect_support_cache_paths(args.support_cache) if args.support_cache else collect_class_image_paths(args.data_root)
     if not classes:
         print(f"No class subfolders with images found under {args.data_root}")
         return
     print(f"Found {len(classes)} classes. Sampling images and generating {args.n_prompts} captions per class.")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    gen = CaptionGenerator(device=device)
+    gen = CaptionGenerator(device=device, llava_model=args.llava_model, allow_fallback=args.allow_fallback)
 
     out = {}
     for classname, images in classes.items():
@@ -225,14 +316,16 @@ def main():
         while len(captions) < args.n_prompts and attempts < args.n_prompts * args.max_retries:
             img_path = imgs[idx % len(imgs)]
             try:
-                caption = gen.generate_for_image(img_path, args.instruction)
+                with Image.open(img_path) as source:
+                    view = render_lesion_preserving_view(source.convert('RGB'))
+                caption = gen.generate_for_image(view, args.instruction)
                 # simple postprocess
                 caption = caption.replace('\n', ' ').strip()
                 # remove trailing periods
                 if caption.endswith('.'):
                     caption = caption[:-1]
                 words = caption.split()
-                if 10 <= len(words) <= 20:
+                if 20 <= len(words) <= 30:
                     if caption not in captions:
                         captions.append(caption)
                         pbar.update(1)
@@ -245,14 +338,13 @@ def main():
             idx += 1
             attempts += 1
         pbar.close()
-        # if not enough captions generated, fill with variants by simple templating
+        # Do not manufacture textual variants: N_cap counts unique generated
+        # captions in the language-teacher definition.
         if len(captions) < args.n_prompts:
-            print(f"Warning: only generated {len(captions)} captions for class {classname}; filling with variants.")
-            base = captions[0] if captions else f"leaf with small concentrated lesions near margin"
-            i = 0
-            while len(captions) < args.n_prompts:
-                captions.append(f"{base} variant {i}")
-                i += 1
+            message = f"Only generated {len(captions)}/{args.n_prompts} unique captions for class {classname}."
+            if not args.allow_incomplete:
+                raise RuntimeError(message + ' Increase --max-retries or use --allow-incomplete explicitly.')
+            print('Warning: ' + message)
         out[classname] = captions[:args.n_prompts]
 
     # write out
