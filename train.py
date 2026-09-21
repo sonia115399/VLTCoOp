@@ -85,10 +85,10 @@ def extend_cfg(cfg):
         'CLASS_TOKEN_POSITION': "end",
         'N_CTX': 4,
         'PREC': "fp32",
-        'LAMBDA_SCV': 0.0,
-        'LAMBDA_SCT': 1.0,
-        'LAMBDA_KDV': 0.0,
-        'LAMBDA_KDT': 1.0,
+        'LAMBDA_VPA': 0.0,
+        'LAMBDA_TPA': 1.0,
+        'LAMBDA_VDM': 0.0,
+        'LAMBDA_TDM': 1.0,
         'TEMPERATURE': 0.01,
         'MAD_THRESHOLD': 1.5,
         'N_CAPTIONS': 50,
@@ -99,10 +99,10 @@ def extend_cfg(cfg):
         # Configurations released before the dual-teacher formulation used
         # implementation-specific names. Keep them as migration aliases.
         aliases = {
-            'VIS_SCCM_LAMBDA': 'LAMBDA_SCV',
-            'SCCM_LAMBDA': 'LAMBDA_SCT',
-            'VIS_KDSP_LAMBDA': 'LAMBDA_KDV',
-            'KDSP_LAMBDA': 'LAMBDA_KDT',
+            'VIS_SCCM_LAMBDA': 'LAMBDA_VPA',
+            'SCCM_LAMBDA': 'LAMBDA_TPA',
+            'VIS_KDSP_LAMBDA': 'LAMBDA_VDM',
+            'KDSP_LAMBDA': 'LAMBDA_TDM',
             'TAU': 'TEMPERATURE',
             'N_PROMPTS': 'N_CAPTIONS',
         }

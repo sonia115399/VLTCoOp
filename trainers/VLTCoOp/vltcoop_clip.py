@@ -255,10 +255,10 @@ class CustomCLIP(nn.Module):
         return (
             student_logits,
             loss_ce,
-            weights.LAMBDA_SCV * loss_scv,
-            weights.LAMBDA_SCT * loss_sct,
-            weights.LAMBDA_KDV * loss_kdv,
-            weights.LAMBDA_KDT * loss_kdt,
+            weights.LAMBDA_VPA * loss_scv,
+            weights.LAMBDA_TPA * loss_sct,
+            weights.LAMBDA_VDM * loss_kdv,
+            weights.LAMBDA_TDM * loss_kdt,
         )
 
 
